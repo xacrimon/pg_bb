@@ -1,7 +1,6 @@
 use crate::context::Context;
 use anyhow::Result;
 use std::fs::{self, File};
-use std::io::BufReader;
 use clap::Args;
 use std::process::{Command, Stdio};
 
@@ -28,7 +27,7 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
         .stderr(Stdio::null())
         .spawn()?;
 
-    let backup_stream = BufReader::new(child.stdout.take().unwrap());
+    let backup_stream = child.stdout.take().unwrap();
 
     let backup_dir_path = ctx.storage.join("backups");
     if !backup_dir_path.exists() {
