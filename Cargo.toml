@@ -1,5 +1,5 @@
 [package]
-name = "pgpitr"
+name = "pg_pitr"
 version = "0.1.0"
 edition = "2021"
 

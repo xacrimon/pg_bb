@@ -24,4 +24,4 @@ Cargo.lock
 
 /target
 /pg_data
-/pgpitr_data
+/pg_pitr_data

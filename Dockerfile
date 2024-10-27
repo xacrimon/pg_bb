@@ -4,4 +4,4 @@ WORKDIR /app
 RUN cargo build
 
 FROM postgres:16.4-bullseye
-COPY --from=builder /app/target/debug/pgpitr /usr/local/bin/pgpitr
+COPY --from=builder /app/target/debug/pg_pitr /usr/local/bin/pg_pitr
