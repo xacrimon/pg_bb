@@ -20,14 +20,15 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
     let raw_wal = File::open(&raw_wal_path)?;
     let wal_data = zstd::stream::encode_all(&raw_wal, 3)?;
     info!(
-        "compressed WAL from {} bytes to {} bytes",
+        "compressed WAL from {} bytes to {} bytes, ratio: {:.2}x",
         raw_wal.metadata()?.len(),
-        wal_data.len()
+        wal_data.len(),
+        (raw_wal.metadata()?.len() as f32) / (wal_data.len() as f32),
     );
     let hash = blake3::hash(&wal_data);
 
     let wal_id = raw_wal_path.file_name().unwrap().to_string_lossy();
-    let wal_target_path = ctx.storage.join("wal").join(format!("{}.zst", wal_id));
+    let wal_target_path = ctx.storage.join(format!("{}.zst", wal_id));
 
     if wal_target_path.exists() {
         let existing_data = fs::read(&wal_target_path)?;

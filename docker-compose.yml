@@ -1,0 +1,19 @@
+name: pgpitr
+
+services:
+  postgres:
+    container_name: pgpitr
+    restart: unless-stopped
+    image: pgpitr
+    build: .
+    command: -c config_file=/etc/postgresql.conf
+    environment:
+      - PGDATA=/var/lib/postgresql/data/pgdata
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - ./postgresql.conf:/etc/postgresql.conf:ro
+      - ./pg_data:/var/lib/postgresql/data:rw
+      - ./pgpitr_data:/opt/pgpitr_data:rw
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]

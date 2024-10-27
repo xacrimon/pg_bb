@@ -1,14 +1,25 @@
 mod context;
 mod ingest_wal;
 
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use context::Context;
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 struct Args {
+    #[clap(flatten)]
+    global: GlobalOptions,
+
     #[clap(subcommand)]
     subcommand: Command,
+}
+
+#[derive(Debug, clap::Args)]
+struct GlobalOptions {
+    storage: PathBuf,
+    cluster_data: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -16,11 +27,15 @@ enum Command {
     IngestWal(ingest_wal::Options),
 }
 
-fn main() {
-    env_logger::Builder::new()
-        .write_style(env_logger::WriteStyle::Always)
-        .build();
-    let args = Args::parse();
+fn main() -> Result<()> {
+    env_logger::init();
 
-    println!("Hello, world!");
+    let args = Args::parse();
+    let context = Context::new(args.global.storage, args.global.cluster_data);
+
+    match args.subcommand {
+        Command::IngestWal(opts) => ingest_wal::run(&context, &opts)?,
+    }
+
+    Ok(())
 }
