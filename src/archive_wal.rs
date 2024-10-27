@@ -16,19 +16,24 @@ pub(super) struct Options {
 
 pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
     let raw_wal_path = ctx.cluster_data.join(&opts.path);
-    info!("ingesting WAL file at {:?}", raw_wal_path);
-    let raw_wal = File::open(&raw_wal_path)?;
-    let wal_data = zstd::stream::encode_all(&raw_wal, 3)?;
+    info!("archiving WAL file at {:?}", raw_wal_path);
+    let raw_wal_data = fs::read(&raw_wal_path)?;
+    let wal_data = zstd::bulk::compress(&raw_wal_data, 3)?;
     info!(
         "compressed WAL from {} bytes to {} bytes, ratio: {:.2}x",
-        raw_wal.metadata()?.len(),
+        raw_wal_data.len(),
         wal_data.len(),
-        (raw_wal.metadata()?.len() as f32) / (wal_data.len() as f32),
+        (raw_wal_data.len() as f32) / (wal_data.len() as f32),
     );
     let hash = blake3::hash(&wal_data);
 
     let wal_id = raw_wal_path.file_name().unwrap().to_string_lossy();
-    let wal_target_path = ctx.storage.join(format!("{}.zst", wal_id));
+    let wal_dir_path = ctx.storage.join("wal");
+    let wal_target_path = wal_dir_path.join(format!("{}.zst", wal_id));
+
+    if !wal_dir_path.exists() {
+        fs::create_dir(&wal_dir_path)?;
+    }
 
     if wal_target_path.exists() {
         let existing_data = fs::read(&wal_target_path)?;
@@ -52,6 +57,6 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
     let mut target_file = File::create(&wal_target_path)?;
     target_file.write_all(&wal_data)?;
     target_file.sync_all()?;
-    info!("completed WAL file ingestion");
+    info!("completed WAL file archiving");
     Ok(())
 }
