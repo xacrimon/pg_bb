@@ -13,6 +13,11 @@ use std::sync::mpsc::{self, channel, TryRecvError};
 use std::thread;
 use std::time;
 
+const LABEL_SCAN_CHUNK_SIZE: u64 = 4096;
+const MIB_UNIT_SCALE: usize = 1024 * 1024;
+const ZSTD_LEVEL: i32 = 3;
+const PROGRESS_LOG_INTERVAL: time::Duration = time::Duration::from_secs(5);
+
 #[derive(Debug, Args)]
 pub(super) struct Options {
     #[arg(long)]
@@ -53,21 +58,20 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
             Err(TryRecvError::Disconnected) => unreachable!(),
         }
 
-        let mut buffer = [0; 4096];
-        let len = backup_stream.read(&mut buffer)?;
-        backup_buffered.extend(&buffer[..len]);
+        let mut chunk = backup_stream.by_ref().take(LABEL_SCAN_CHUNK_SIZE);
+        let copied = io::copy(&mut chunk, &mut backup_buffered)?;
 
-        if len == 0 {
+        if copied == 0 {
             unreachable!();
         }
     };
 
+    hex::decode(&label).expect("invalid label");
     info!(
         "found wal label {} after scanning {} bytes",
         label,
         backup_buffered.len()
     );
-    hex::decode(label).expect("invalid label");
 
     let backup_dir_path = ctx.storage.join("backups");
     if !backup_dir_path.exists() {
@@ -84,14 +88,16 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
 
     let mut tracked_reader = TrackedReader::new(buffer_and_stream, &total_read_bytes);
     let tracked_writer = TrackedWriter::new(&target_file, &total_written_bytes);
-    let mut encoder = zstd::stream::write::Encoder::new(tracked_writer, 3)?;
+
+    type EncoderType<'a, 'b, 'c> = zstd::stream::Encoder<'a, TrackedWriter<'b, &'c File>>;
+    let chunk_size = EncoderType::recommended_input_size();
+    let mut encoder = EncoderType::new(tracked_writer, ZSTD_LEVEL)?;
     let start_time = time::Instant::now();
     let mut last_info = start_time;
 
-    let unit_scale = 1024 * 1024;
-    let read = || total_read_bytes.get() / unit_scale;
+    let read = || total_read_bytes.get() / MIB_UNIT_SCALE;
     let read_rate = || (read() as f32) / start_time.elapsed().as_secs_f32();
-    let written = || total_written_bytes.get() / unit_scale;
+    let written = || total_written_bytes.get() / MIB_UNIT_SCALE;
     let written_rate = || (written() as f32) / start_time.elapsed().as_secs_f32();
     let ratio = || (total_read_bytes.get() as f32) / (total_written_bytes.get() as f32);
 
@@ -108,14 +114,14 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
     };
 
     loop {
-        let chunk_size = 4 * 1024 * 1024;
-        let mut chunk = tracked_reader.by_ref().take(chunk_size);
+        let mut chunk = tracked_reader.by_ref().take(chunk_size as u64);
         let copied = io::copy(&mut chunk, &mut encoder)?;
+
         if copied == 0 {
             break;
         }
 
-        if last_info.elapsed() >= time::Duration::from_secs(5) {
+        if last_info.elapsed() >= PROGRESS_LOG_INTERVAL {
             log_stats(false);
             last_info = time::Instant::now();
         }
