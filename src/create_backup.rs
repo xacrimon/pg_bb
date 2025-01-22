@@ -154,7 +154,7 @@ fn find_wal_label(stream: SplitReceiver) -> Result<String> {
                 continue;
             }
 
-            let part = match line.split("file").skip(1).next() {
+            let part = match line.split("file").nth(1) {
                 Some(part) => part,
                 None => continue,
             };
