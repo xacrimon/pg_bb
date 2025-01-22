@@ -1,10 +1,10 @@
-name: pgpitr
+name: pg_pitr
 
 services:
   postgres:
-    container_name: pgpitr
+    container_name: pg_pitr
     restart: unless-stopped
-    image: pgpitr
+    image: pg_pitr
     build: .
     command: -c config_file=/etc/postgresql.conf
     environment:
