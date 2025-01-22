@@ -1,5 +1,5 @@
-mod context;
 mod archive_wal;
+mod context;
 mod create_backup;
 
 use anyhow::Result;
