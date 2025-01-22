@@ -51,7 +51,7 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
         label_tx.send(label_search).unwrap();
     });
 
-    let mut backup_buffered: Vec<u8> = Vec::new();
+    let mut backup_buffered = Vec::new();
     let label = loop {
         match label_rx.try_recv() {
             Ok(res) => break res?,
