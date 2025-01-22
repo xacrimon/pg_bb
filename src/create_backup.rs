@@ -76,11 +76,12 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
     let mut total_read_bytes = 0;
     let mut total_written_bytes = 0;
 
-    zstd::stream::copy_encode(
-        TrackedReader::new(buffer_and_stream, &mut total_read_bytes),
-        TrackedWriter::new(&target_file, &mut total_written_bytes),
-        3,
-    )?;
+    let mut tracked_reader = TrackedReader::new(buffer_and_stream, &mut total_read_bytes);
+    let tracked_writer = TrackedWriter::new(&target_file, &mut total_written_bytes);
+    let mut encoder = zstd::stream::write::Encoder::new(tracked_writer, 3)?;
+
+    io::copy(&mut tracked_reader, &mut encoder)?;
+    encoder.finish()?;
     target_file.sync_all()?;
 
     info!(
