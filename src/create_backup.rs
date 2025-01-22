@@ -3,6 +3,7 @@ use anyhow::bail;
 use anyhow::Result;
 use clap::Args;
 use log::info;
+use std::cell::Cell;
 use std::cmp;
 use std::fs::{self, File};
 use std::io;
@@ -10,6 +11,7 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, channel, TryRecvError};
 use std::thread;
+use std::time;
 
 #[derive(Debug, Args)]
 pub(super) struct Options {
@@ -54,10 +56,14 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
         let mut buffer = [0; 4096];
         let len = backup_stream.read(&mut buffer)?;
         backup_buffered.extend(&buffer[..len]);
+
+        if len == 0 {
+            unreachable!();
+        }
     };
 
     info!(
-        "found label {} after scanning {} bytes",
+        "found wal label {} after scanning {} bytes",
         label,
         backup_buffered.len()
     );
@@ -73,23 +79,53 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
     info!("writing backup to {:?}...", backup_target_path);
 
     let buffer_and_stream = backup_buffered.as_slice().chain(backup_stream);
-    let mut total_read_bytes = 0;
-    let mut total_written_bytes = 0;
+    let total_read_bytes = Cell::new(0);
+    let total_written_bytes = Cell::new(0);
 
-    let mut tracked_reader = TrackedReader::new(buffer_and_stream, &mut total_read_bytes);
-    let tracked_writer = TrackedWriter::new(&target_file, &mut total_written_bytes);
+    let mut tracked_reader = TrackedReader::new(buffer_and_stream, &total_read_bytes);
+    let tracked_writer = TrackedWriter::new(&target_file, &total_written_bytes);
     let mut encoder = zstd::stream::write::Encoder::new(tracked_writer, 3)?;
+    let start_time = time::Instant::now();
+    let mut last_info = start_time;
 
-    io::copy(&mut tracked_reader, &mut encoder)?;
+    let unit_scale = 1024 * 1024;
+    let read = || total_read_bytes.get() / unit_scale;
+    let read_rate = || (read() as f32) / start_time.elapsed().as_secs_f32();
+    let written = || total_written_bytes.get() / unit_scale;
+    let written_rate = || (written() as f32) / start_time.elapsed().as_secs_f32();
+    let ratio = || (total_read_bytes.get() as f32) / (total_written_bytes.get() as f32);
+
+    let log_stats = |last: bool| {
+        info!(
+            "{}processed {} MiB @ {:.0} MiB/s, written {} MiB @ {:.0} MiB/s, compression ratio: {:.2}x",
+            if !last { "progress: " } else { "" },
+            read(),
+            read_rate(),
+            written(),
+            written_rate(),
+            ratio()
+        );
+    };
+
+    loop {
+        let chunk_size = 4 * 1024 * 1024;
+        let mut chunk = tracked_reader.by_ref().take(chunk_size);
+        let copied = io::copy(&mut chunk, &mut encoder)?;
+        if copied == 0 {
+            break;
+        }
+
+        if last_info.elapsed() >= time::Duration::from_secs(5) {
+            log_stats(false);
+            last_info = time::Instant::now();
+        }
+    }
+
+    log_stats(true);
+    info!("write finished, flushing...");
     encoder.finish()?;
+    info!("syncing file...");
     target_file.sync_all()?;
-
-    info!(
-        "compressed backup from {} bytes to {} bytes, ratio: {:.2}x",
-        total_read_bytes,
-        total_written_bytes,
-        (total_read_bytes as f32) / (total_written_bytes as f32)
-    );
     info!("completed backup");
     Ok(())
 }
@@ -121,11 +157,11 @@ fn find_wal_label(stream: SplitReceiver) -> Result<String> {
 
 struct TrackedReader<'tracker, R> {
     inner: R,
-    total_bytes: &'tracker mut usize,
+    total_bytes: &'tracker Cell<usize>,
 }
 
 impl<'tracker, R> TrackedReader<'tracker, R> {
-    fn new(inner: R, total_bytes: &'tracker mut usize) -> Self {
+    fn new(inner: R, total_bytes: &'tracker Cell<usize>) -> Self {
         Self { inner, total_bytes }
     }
 }
@@ -136,18 +172,18 @@ where
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let len = self.inner.read(buf)?;
-        *self.total_bytes += len;
+        self.total_bytes.set(self.total_bytes.get() + len);
         Ok(len)
     }
 }
 
 struct TrackedWriter<'tracker, W> {
     inner: W,
-    total_bytes: &'tracker mut usize,
+    total_bytes: &'tracker Cell<usize>,
 }
 
 impl<'tracker, W> TrackedWriter<'tracker, W> {
-    fn new(inner: W, total_bytes: &'tracker mut usize) -> Self {
+    fn new(inner: W, total_bytes: &'tracker Cell<usize>) -> Self {
         Self { inner, total_bytes }
     }
 }
@@ -158,7 +194,7 @@ where
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let len = self.inner.write(buf)?;
-        *self.total_bytes += len;
+        self.total_bytes.set(self.total_bytes.get() + len);
         Ok(len)
     }
 
