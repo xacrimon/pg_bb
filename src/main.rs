@@ -46,3 +46,12 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+// TODO: - zfs vs pg_basebackup as a backup data provider
+//       - content addressable storage based differential backups
+//       - proper restore features
+//       - storages: local, s3, gcs, azure, wasabi, b2
+//       - encryption
+//       - repository format
+//       - repository management
+//       - config files
