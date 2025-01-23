@@ -25,11 +25,12 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
         wal_data.len(),
         (raw_wal_data.len() as f32) / (wal_data.len() as f32),
     );
-    let hash = blake3::hash(&wal_data);
 
+    let hash = blake3::hash(&raw_wal_data);
     let wal_id = raw_wal_path.file_name().unwrap().to_string_lossy();
     let wal_dir_path = ctx.storage.join("wal");
-    let wal_target_path = wal_dir_path.join(format!("{}.zst", wal_id));
+    let checksum = hex::encode(hash.as_bytes());
+    let wal_target_path = wal_dir_path.join(format!("{}-{}.zst", wal_id, checksum));
 
     if !wal_dir_path.exists() {
         fs::create_dir(&wal_dir_path)?;
@@ -41,7 +42,7 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
 
         if existing_hash == hash {
             info!(
-                "WAL file already exists at {:?} with matching hash",
+                "WAL file already exists at {:?} with matching hash, skipping",
                 wal_target_path
             );
             return Ok(());
