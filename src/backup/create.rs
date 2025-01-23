@@ -143,7 +143,7 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
     let manifest_target_path = backup_dir_path.join(format!("{}.yaml", bundle_id));
     let manifest = Manifest {
         id: bundle_id,
-        created_at: backup_time.unix_timestamp(),
+        created_at: backup_time,
         label: opts.label.clone(),
         checksum: tracked_reader.finalize(),
     };
