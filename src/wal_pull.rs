@@ -11,12 +11,12 @@ use std::path::PathBuf;
 use clap::Args;
 
 #[derive(Debug, Args)]
-pub(super) struct Options {
+pub struct Options {
     #[arg(long)]
-    pub(super) path: PathBuf,
+    pub path: PathBuf,
 
     #[arg(long)]
-    pub(super) name: String,
+    pub name: String,
 }
 
 pub fn run(ctx: &Context, opts: &Options) -> Result<()> {

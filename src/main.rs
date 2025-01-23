@@ -1,5 +1,5 @@
+mod backup;
 mod context;
-mod create_backup;
 mod wal_pull;
 mod wal_push;
 
@@ -26,7 +26,7 @@ struct GlobalOptions {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    CreateBackup(create_backup::Options),
+    CreateBackup(backup::create::Options),
     WalPush(wal_push::Options),
     WalPull(wal_pull::Options),
 }
@@ -38,7 +38,7 @@ fn main() -> Result<()> {
     let context = Context::new(args.global.storage, args.global.cluster_data);
 
     match args.subcommand {
-        Command::CreateBackup(opts) => create_backup::run(&context, &opts)?,
+        Command::CreateBackup(opts) => backup::create::run(&context, &opts)?,
         Command::WalPush(opts) => wal_push::run(&context, &opts)?,
         Command::WalPull(opts) => wal_pull::run(&context, &opts)?,
     }

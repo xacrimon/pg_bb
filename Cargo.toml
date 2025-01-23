@@ -2,13 +2,27 @@
 name = "pg_pitr"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.80"
+
+[profile.ci]
+inherits = "dev"
+incremental = false
+
+[profile.release]
+debug = "line-tables-only"
+strip = "debuginfo"
+lto = "thin"
 
 [dependencies]
 clap = { version = "4.5.20", features = ["derive"] }
+serde = { version = "1.0.217", features = ["derive"] }
+serde_yaml = "0.9.34"
 anyhow = "1.0.91"
 zstd = "0.13.2"
-blake3 = "1.5.4"
+blake3 = { version = "1.5.4", features = ["serde"]}
 log = "0.4.22"
 env_logger = "0.11.5"
 tar = "0.4.42"
 hex = "0.4.3"
+uuid = { version = "1.12.1", features = ["serde", "v4"] }
+time = { version = "0.3", features = ["serde", "serde-human-readable", "formatting", "local-offset"] }

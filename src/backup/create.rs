@@ -1,8 +1,10 @@
+use super::manifest::Manifest;
 use crate::context::Context;
+use ::time::OffsetDateTime;
 use anyhow::bail;
 use anyhow::Result;
 use clap::Args;
-use log::info;
+use log::{error, info};
 use std::cell::Cell;
 use std::cmp;
 use std::fs::{self, File};
@@ -13,6 +15,7 @@ use std::str;
 use std::sync::mpsc::{self, channel, TryRecvError};
 use std::thread;
 use std::time;
+use uuid::Uuid;
 
 const LABEL_SCAN_CHUNK_SIZE: u64 = 4096;
 const MIB_UNIT_SCALE: usize = 1024 * 1024;
@@ -20,12 +23,13 @@ const ZSTD_LEVEL: i32 = 3;
 const PROGRESS_LOG_INTERVAL: time::Duration = time::Duration::from_secs(5);
 
 #[derive(Debug, Args)]
-pub(super) struct Options {
+pub struct Options {
     #[arg(long)]
-    pub(super) label: String,
+    pub label: String,
 }
 
 pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
+    let backup_time = OffsetDateTime::now_utc();
     info!("starting backup with label {}", opts.label);
 
     let mut child = Command::new("pg_basebackup")
@@ -79,15 +83,16 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
         fs::create_dir(&backup_dir_path)?;
     }
 
-    let backup_target_path = backup_dir_path.join(format!("{}.tar.zst", &opts.label));
+    let bundle_id = Uuid::new_v4();
+    let backup_target_path = backup_dir_path.join(format!("{}.tar.zst", bundle_id));
     let target_file = File::create(&backup_target_path)?;
-    info!("writing backup to {:?}...", backup_target_path);
+    info!("writing bundle to {:?}...", backup_target_path);
 
     let buffer_and_stream = backup_buffered.as_slice().chain(backup_stream.into_inner());
     let total_read_bytes = Cell::new(0);
     let total_written_bytes = Cell::new(0);
 
-    let mut tracked_reader = TrackedReader::new(buffer_and_stream, &total_read_bytes);
+    let mut tracked_reader = TrackedHashingReader::new(buffer_and_stream, &total_read_bytes);
     let tracked_writer = TrackedWriter::new(&target_file, &total_written_bytes);
 
     type EncoderType<'a, 'b, 'c> = zstd::stream::Encoder<'a, TrackedWriter<'b, &'c File>>;
@@ -104,9 +109,7 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
         info!(
             "{header}processed {read} MiB @ {read_rate:.0} MiB/s, written {written} MiB @ {written_rate:.0} MiB/s, compression ratio: {ratio:.2}x",
             header = if !last { "progress: " } else { "" },
-            read = read,
             read_rate = read as f32 / elapsed,
-            written = written,
             written_rate = written as f32 / elapsed,
             ratio = total_read_bytes.get() as f32 / total_written_bytes.get() as f32
         );
@@ -127,6 +130,24 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
     }
 
     log_stats(true);
+    let status = child.wait()?;
+    if !status.success() {
+        error!("something went wrong, cleaning up...");
+        bail!("pg_basebackup failed with status: {}", status);
+    }
+
+    let manifest_target_path = backup_dir_path.join(format!("{}.yaml", bundle_id));
+    let manifest = Manifest {
+        id: bundle_id,
+        created_at: backup_time.unix_timestamp(),
+        label: opts.label.clone(),
+        checksum: tracked_reader.finalize(),
+    };
+
+    info!("writing manifest to {:?}", manifest_target_path);
+    let serialized = serde_yaml::to_string(&manifest)?;
+    fs::write(&manifest_target_path, serialized)?;
+
     info!("write finished, flushing...");
     encoder.finish()?;
     info!("syncing file...");
@@ -170,24 +191,34 @@ fn find_wal_label(stream: SplitReceiver) -> Result<String> {
     bail!("No backup label found")
 }
 
-struct TrackedReader<'tracker, R> {
+struct TrackedHashingReader<'tracker, R> {
     inner: R,
     total_bytes: &'tracker Cell<usize>,
+    hash_state: blake3::Hasher,
 }
 
-impl<'tracker, R> TrackedReader<'tracker, R> {
+impl<'tracker, R> TrackedHashingReader<'tracker, R> {
     fn new(inner: R, total_bytes: &'tracker Cell<usize>) -> Self {
-        Self { inner, total_bytes }
+        Self {
+            inner,
+            total_bytes,
+            hash_state: blake3::Hasher::new(),
+        }
+    }
+
+    fn finalize(self) -> blake3::Hash {
+        self.hash_state.finalize()
     }
 }
 
-impl<'tracker, R> Read for TrackedReader<'tracker, R>
+impl<'tracker, R> Read for TrackedHashingReader<'tracker, R>
 where
     R: Read,
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let len = self.inner.read(buf)?;
         self.total_bytes.set(self.total_bytes.get() + len);
+        self.hash_state.update(&buf[..len]);
         Ok(len)
     }
 }
