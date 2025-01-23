@@ -3,10 +3,11 @@ mod context;
 mod wal_pull;
 mod wal_push;
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use context::Context;
-use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]

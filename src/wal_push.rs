@@ -1,12 +1,14 @@
-use crate::context::Context;
-use anyhow::bail;
-use anyhow::Result;
-use log::info;
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::PathBuf;
+use std::{
+    fs::{self, File},
+    io::Write,
+    path::PathBuf,
+};
 
+use anyhow::{bail, Result};
 use clap::Args;
+use log::info;
+
+use crate::context::Context;
 
 #[derive(Debug, Args)]
 pub struct Options {

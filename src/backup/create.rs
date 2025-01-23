@@ -1,21 +1,24 @@
-use super::manifest::Manifest;
-use crate::context::Context;
+use std::{
+    cell::Cell,
+    cmp,
+    fs::{self, File},
+    io,
+    io::{Read, Write},
+    process::{Command, Stdio},
+    str,
+    sync::mpsc::{self, channel, TryRecvError},
+    thread,
+    time,
+};
+
 use ::time::OffsetDateTime;
-use anyhow::bail;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Args;
 use log::{error, info};
-use std::cell::Cell;
-use std::cmp;
-use std::fs::{self, File};
-use std::io;
-use std::io::{Read, Write};
-use std::process::{Command, Stdio};
-use std::str;
-use std::sync::mpsc::{self, channel, TryRecvError};
-use std::thread;
-use std::time;
 use uuid::Uuid;
+
+use super::manifest::Manifest;
+use crate::context::Context;
 
 const LABEL_SCAN_CHUNK_SIZE: u64 = 4096;
 const MIB_UNIT_SCALE: usize = 1024 * 1024;
@@ -107,7 +110,8 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
         let written = total_written_bytes.get() / MIB_UNIT_SCALE;
 
         info!(
-            "{header}processed {read} MiB @ {read_rate:.0} MiB/s, written {written} MiB @ {written_rate:.0} MiB/s, compression ratio: {ratio:.2}x",
+            "{header}processed {read} MiB @ {read_rate:.0} MiB/s, written {written} MiB @ \
+             {written_rate:.0} MiB/s, compression ratio: {ratio:.2}x",
             header = if !last { "progress: " } else { "" },
             read_rate = read as f32 / elapsed,
             written_rate = written as f32 / elapsed,
