@@ -12,11 +12,14 @@ use clap::Args;
 pub(super) struct Options {
     #[arg(long)]
     pub(super) path: PathBuf,
+
+    #[arg(long)]
+    pub(super) name: String,
 }
 
 pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
     let raw_wal_path = ctx.cluster_data.join(&opts.path);
-    info!("archiving WAL file at {:?}", raw_wal_path);
+    info!("pushing WAL file at {:?}", raw_wal_path);
     let raw_wal_data = fs::read(&raw_wal_path)?;
     let wal_data = zstd::bulk::compress(&raw_wal_data, 3)?;
     info!(
@@ -27,10 +30,9 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
     );
 
     let hash = blake3::hash(&raw_wal_data);
-    let wal_id = raw_wal_path.file_name().unwrap().to_string_lossy();
     let wal_dir_path = ctx.storage.join("wal");
     let checksum = hex::encode(hash.as_bytes());
-    let wal_target_path = wal_dir_path.join(format!("{}-{}.zst", wal_id, checksum));
+    let wal_target_path = wal_dir_path.join(format!("{}-{}.zst", opts.name, checksum));
 
     if !wal_dir_path.exists() {
         fs::create_dir(&wal_dir_path)?;
@@ -58,6 +60,6 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
     let mut target_file = File::create(&wal_target_path)?;
     target_file.write_all(&wal_data)?;
     target_file.sync_all()?;
-    info!("completed WAL file archiving");
+    info!("completed WAL file push");
     Ok(())
 }

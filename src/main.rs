@@ -1,6 +1,7 @@
-mod wal_push;
 mod context;
 mod create_backup;
+mod wal_pull;
+mod wal_push;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -25,8 +26,9 @@ struct GlobalOptions {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    WalPush(wal_push::Options),
     CreateBackup(create_backup::Options),
+    WalPush(wal_push::Options),
+    WalPull(wal_pull::Options),
 }
 
 fn main() -> Result<()> {
@@ -36,8 +38,9 @@ fn main() -> Result<()> {
     let context = Context::new(args.global.storage, args.global.cluster_data);
 
     match args.subcommand {
-        Command::WalPush(opts) => wal_push::run(&context, &opts)?,
         Command::CreateBackup(opts) => create_backup::run(&context, &opts)?,
+        Command::WalPush(opts) => wal_push::run(&context, &opts)?,
+        Command::WalPull(opts) => wal_pull::run(&context, &opts)?,
     }
 
     Ok(())
