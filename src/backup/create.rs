@@ -1,8 +1,11 @@
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     fs::{self, File},
     io::{self, BufRead, BufWriter, Read, Write},
     path::{Path, PathBuf},
+    str,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -57,14 +60,15 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
         fs::create_dir(&chunk_dir_path)?;
     }
 
+    let mut metrics = Metrics::new();
     let data = match &opts.delta {
         Some(delta_from) => {
             let delta_from_path = backup_dir_path.join(format!("{}.manifest", delta_from));
             let delta_from_data = fs::read_to_string(&delta_from_path)?;
             let delta_from: Manifest = serde_yaml::from_str(&delta_from_data)?;
-            do_incremental(ctx, id, &delta_from)?
+            do_incremental(ctx, &mut metrics, id, &delta_from)?
         },
-        None => do_full(ctx)?,
+        None => do_full(ctx, &mut metrics)?,
     };
 
     let manifest = Manifest {
@@ -84,35 +88,45 @@ pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
     Ok(())
 }
 
-fn do_incremental(ctx: &Context, id: Uuid, delta_from: &Manifest) -> Result<BackupKind> {
+fn do_incremental(
+    ctx: &Context,
+    metrics: &mut Metrics,
+    id: Uuid,
+    delta_from: &Manifest,
+) -> Result<BackupKind> {
     let mut changed_files = HashMap::new();
     let bundle_path = ctx.storage.join("bundles").join(format!("{}.tar.zst", id));
     let bundle_file = File::create_new(&bundle_path)?;
+    let tracked_writer = metrics.track_writer(&bundle_file);
     let mut bundle =
-        tar::Builder::new(zstd::stream::Encoder::new(&bundle_file, ZSTD_LEVEL).unwrap());
+        tar::Builder::new(zstd::stream::Encoder::new(tracked_writer, ZSTD_LEVEL).unwrap());
 
     for path in target_files(ctx) {
         let path = path?;
-        let path = path.strip_prefix(&ctx.cluster_data)?;
+        let stripped_path = path.as_path().strip_prefix(&ctx.cluster_data)?;
 
         let mut changed_blocks = HashSet::new();
         let mut small_block_index = 0;
 
-        let file = File::open(path)?;
+        let file = File::open(&path)?;
         let mut chunker = Chunker::new(file);
         while let Some(chunk) = chunker.next_chunk() {
+            metrics.add_read(chunk.len() as u64);
+
             for small_block in chunk.chunks(8 * 1024) {
                 let hash: blake3::Hash = blake3::hash(small_block);
 
-                if block_changed(delta_from, path, small_block_index, hash) {
+                if block_changed(delta_from, stripped_path, small_block_index, hash) {
                     let mut header = tar::Header::new_old();
-                    let block_path = path.join(small_block_index.to_string());
+                    let block_path = stripped_path.join(small_block_index.to_string());
 
                     header.set_path(&block_path)?;
                     header.set_size(small_block.len() as u64);
 
                     bundle.append(&header, small_block)?;
                     changed_blocks.insert((small_block_index, ChunkRef(hash)));
+                } else {
+                    metrics.add_deduplicated(small_block.len() as u64);
                 }
 
                 small_block_index += 1;
@@ -120,32 +134,34 @@ fn do_incremental(ctx: &Context, id: Uuid, delta_from: &Manifest) -> Result<Back
         }
 
         if !changed_blocks.is_empty() {
-            changed_files.insert(path.to_owned(), changed_blocks);
+            changed_files.insert(stripped_path.to_owned(), changed_blocks);
         }
+        metrics.log_progress(false);
     }
 
     bundle.into_inner().unwrap().finish()?;
     bundle_file.sync_all()?;
 
+    metrics.log_progress(true);
     Ok(BackupKind::Incremental {
         references: delta_from.id,
         changed_blocks: changed_files,
     })
 }
 
-fn do_full(ctx: &Context) -> Result<BackupKind> {
+fn do_full(ctx: &Context, metrics: &mut Metrics) -> Result<BackupKind> {
     let mut files = HashMap::new();
 
     for path in target_files(ctx) {
         let path = path?;
-        let path = path.strip_prefix(&ctx.cluster_data)?;
 
         let mut chunks = Vec::new();
         let mut blocks = Vec::new();
 
-        let file = File::open(path)?;
+        let file = File::open(&path)?;
         let mut chunker = Chunker::new(file);
         while let Some(chunk) = chunker.next_chunk() {
+            metrics.add_read(chunk.len() as u64);
             let hash: blake3::Hash = blake3::hash(chunk);
             chunks.push(ChunkRef(hash));
 
@@ -157,6 +173,9 @@ fn do_full(ctx: &Context) -> Result<BackupKind> {
                 let mut chunk_file = File::create_new(&chunk_path)?;
                 chunk_file.write_all(&chunk_data)?;
                 chunk_file.sync_all()?;
+                metrics.add_written(chunk_data.len() as u64);
+            } else {
+                metrics.add_deduplicated(chunk.len() as u64);
             }
 
             for small_block in chunk.chunks(8 * 1024) {
@@ -165,9 +184,12 @@ fn do_full(ctx: &Context) -> Result<BackupKind> {
             }
         }
 
+        let path = path.strip_prefix(&ctx.cluster_data)?;
         files.insert(path.to_owned(), FileInfo { chunks, blocks });
+        metrics.log_progress(false);
     }
 
+    metrics.log_progress(true);
     Ok(BackupKind::Full { files })
 }
 
@@ -201,6 +223,88 @@ fn target_files(ctx: &Context) -> impl Iterator<Item = Result<PathBuf>> {
                 .map(|entry| entry.path().to_owned())
                 .map_err(Into::into)
         })
+}
+
+struct Metrics {
+    start_time: Instant,
+    last_log_time: Cell<Instant>,
+    read_bytes: Cell<u64>,
+    deduplicated_bytes: Cell<u64>,
+    written_bytes: Cell<u64>,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self {
+            start_time: Instant::now(),
+            last_log_time: Cell::new(Instant::now()),
+            read_bytes: Cell::new(0),
+            deduplicated_bytes: Cell::new(0),
+            written_bytes: Cell::new(0),
+        }
+    }
+
+    fn add_read(&self, bytes: u64) {
+        self.read_bytes.set(self.read_bytes.get() + bytes);
+    }
+
+    fn add_written(&self, bytes: u64) {
+        self.written_bytes.set(self.written_bytes.get() + bytes);
+    }
+
+    fn track_writer(&self, writer: impl Write) -> TrackedWriter<impl Write> {
+        TrackedWriter {
+            inner: writer,
+            total_bytes: &self.written_bytes,
+        }
+    }
+
+    fn add_deduplicated(&self, bytes: u64) {
+        self.deduplicated_bytes
+            .set(self.deduplicated_bytes.get() + bytes);
+    }
+
+    fn log_progress(&self, last: bool) {
+        if last || self.last_log_time.get().elapsed() >= PROGRESS_LOG_INTERVAL {
+            self.last_log_time.set(Instant::now());
+            let read_bytes = self.read_bytes.get();
+            let deduplicated_bytes = self.deduplicated_bytes.get();
+            let written_bytes = self.written_bytes.get();
+            let elapsed_secs = self.start_time.elapsed().as_secs_f32();
+            let dedup_ratio = deduplicated_bytes as f32 / read_bytes as f32;
+            let throughput = read_bytes as f32 / elapsed_secs / 1024.0 / 1024.0;
+            info!(
+                "read: {} MiB, dedup: {} MiB ({:.2}%), write: {} MiB, compression ratio: {:.2}x, \
+                 throughput: {:.2} MiB/s",
+                read_bytes / 1024 / 1024,
+                deduplicated_bytes / 1024 / 1024,
+                dedup_ratio * 100.0,
+                written_bytes / 1024 / 1024,
+                (read_bytes - deduplicated_bytes) as f32 / written_bytes as f32,
+                throughput
+            );
+        }
+    }
+}
+
+struct TrackedWriter<'tracker, W> {
+    inner: W,
+    total_bytes: &'tracker Cell<u64>,
+}
+
+impl<'tracker, W> Write for TrackedWriter<'tracker, W>
+where
+    W: Write,
+{
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let len = self.inner.write(buf)?;
+        self.total_bytes.set(self.total_bytes.get() + len as u64);
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 struct Chunker<R> {
