@@ -94,6 +94,7 @@ fn do_incremental(
     id: Uuid,
     delta_from: &Manifest,
 ) -> Result<BackupKind> {
+    let mut block_changed = block_changed(ctx, delta_from.id);
     let mut changed_files = HashMap::new();
     let bundle_path = ctx.storage.join("bundles").join(format!("{}.tar.zst", id));
     let bundle_file = File::create_new(&bundle_path)?;
@@ -105,7 +106,7 @@ fn do_incremental(
         let path = path?;
         let stripped_path = path.as_path().strip_prefix(&ctx.cluster_data)?;
 
-        let mut changed_blocks = HashSet::new();
+        let mut changed_blocks = HashMap::new();
         let mut small_block_index = 0;
 
         let file = File::open(&path)?;
@@ -116,7 +117,7 @@ fn do_incremental(
             for small_block in chunk.chunks(8 * 1024) {
                 let hash: blake3::Hash = blake3::hash(small_block);
 
-                if block_changed(delta_from, stripped_path, small_block_index, hash) {
+                if block_changed(stripped_path, small_block_index, hash) {
                     let mut header = tar::Header::new_old();
                     let block_path = stripped_path.join(small_block_index.to_string());
 
@@ -124,7 +125,7 @@ fn do_incremental(
                     header.set_size(small_block.len() as u64);
 
                     bundle.append(&header, small_block)?;
-                    changed_blocks.insert((small_block_index, ChunkRef(hash)));
+                    changed_blocks.insert(small_block_index, ChunkRef(hash));
                 } else {
                     metrics.add_deduplicated(small_block.len() as u64);
                 }
@@ -193,18 +194,50 @@ fn do_full(ctx: &Context, metrics: &mut Metrics) -> Result<BackupKind> {
     Ok(BackupKind::Full { files })
 }
 
-fn block_changed(delta_from: &Manifest, file: &Path, index: usize, hash: blake3::Hash) -> bool {
-    match &delta_from.data {
-        BackupKind::Full { files } => {
-            let info = files.get(file);
-            info.map(|info| info.blocks.get(index)).flatten() != Some(&ChunkRef(hash))
-        },
-        BackupKind::Incremental { changed_blocks, .. } => {
-            let blocks = changed_blocks.get(file);
-            blocks
-                .map(|blocks| blocks.contains(&(index, ChunkRef(hash))))
-                .unwrap_or(false)
-        },
+// TODO: error handling + avoid loading all manifests?
+fn block_changed(
+    ctx: &Context,
+    delta_from: Uuid,
+) -> impl FnMut(&Path, usize, blake3::Hash) -> bool + '_ {
+    let mut manifests = HashMap::new();
+
+    ctx.storage
+        .join("backups")
+        .read_dir()
+        .unwrap()
+        .for_each(|entry| {
+            let entry = entry.unwrap();
+            let manifest_path = entry.path();
+            let manifest_data = fs::read_to_string(&manifest_path).unwrap();
+            let manifest: Manifest = serde_yaml::from_str(&manifest_data).unwrap();
+            manifests.insert(manifest.id, manifest);
+        });
+
+    move |file, index, hash| {
+        let mut node = delta_from;
+
+        loop {
+            match &manifests[&node].data {
+                BackupKind::Full { files } => {
+                    let info = files.get(file);
+                    break info.map(|info| info.blocks.get(index)).flatten()
+                        != Some(&ChunkRef(hash));
+                },
+                BackupKind::Incremental {
+                    references,
+                    changed_blocks,
+                } => {
+                    let blocks = changed_blocks.get(file);
+                    let chunk_ref = blocks.map(|blocks| blocks.get(&index)).flatten();
+
+                    if let Some(chunk_ref) = chunk_ref {
+                        break chunk_ref != &ChunkRef(hash);
+                    } else {
+                        node = *references;
+                    }
+                },
+            }
+        }
     }
 }
 

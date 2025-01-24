@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-};
+use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use time::OffsetDateTime;
@@ -32,7 +29,7 @@ pub enum BackupKind {
     },
     Incremental {
         references: Uuid,
-        changed_blocks: HashMap<PathBuf, HashSet<(usize, ChunkRef)>>,
+        changed_blocks: HashMap<PathBuf, HashMap<usize, ChunkRef>>,
     },
 }
 
