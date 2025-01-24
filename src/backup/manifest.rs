@@ -1,3 +1,5 @@
+use std::{collections::HashMap, path::PathBuf};
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -11,26 +13,32 @@ pub struct Manifest {
     )]
     pub created_at: OffsetDateTime,
     pub label: String,
-    #[serde(
-        serialize_with = "serialize_hash",
-        deserialize_with = "deserialize_hash"
-    )]
-    pub checksum: blake3::Hash,
+    pub files: HashMap<PathBuf, Vec<ChunkRef>>,
+    pub small_blocks: HashMap<PathBuf, Vec<ChunkRef>>,
 }
 
-fn serialize_hash<S>(hash: &blake3::Hash, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
+#[derive(Debug)]
+pub struct ChunkRef(pub blake3::Hash);
+
+impl Serialize for ChunkRef
 {
-    serializer.serialize_str(&hash.to_hex())
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0.to_hex())
+    }
 }
 
-fn deserialize_hash<'de, D>(deserializer: D) -> Result<blake3::Hash, D::Error>
-where
-    D: Deserializer<'de>,
+impl<'de> Deserialize<'de> for ChunkRef
 {
-    let s = String::deserialize(deserializer)?;
-    Ok(blake3::Hash::from_hex(&s).unwrap())
+    fn deserialize<D>(deserializer: D) -> Result<ChunkRef, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(ChunkRef(blake3::Hash::from_hex(&s).unwrap()))
+    }
 }
 
 fn serialize_timestamp<S>(dt: &OffsetDateTime, serializer: S) -> Result<S::Ok, S::Error>
