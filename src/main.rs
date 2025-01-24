@@ -55,3 +55,5 @@ fn main() -> Result<()> {
 //       - repository format
 //       - repository management
 //       - config files
+//       - async/batched archive/restore
+//       - track wal archives needed for backup

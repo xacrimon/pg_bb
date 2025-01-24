@@ -19,7 +19,7 @@ serde = { version = "1.0.217", features = ["derive"] }
 serde_yaml = "0.9.34"
 anyhow = "1.0.91"
 zstd = "0.13.2"
-blake3 = { version = "1.5.4", features = ["serde"]} # TODO: remove
+blake3 = { version = "1.5.4", features = ["serde"] } # TODO: remove
 log = "0.4.22"
 env_logger = "0.11.5"
 tar = "0.4.42"
