@@ -1,10 +1,9 @@
 use std::{
     cell::Cell,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs::{self, File},
-    io::{self, BufRead, BufWriter, Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
-    str,
     time::{Duration, Instant},
 };
 
@@ -12,7 +11,6 @@ use anyhow::Result;
 use clap::Args;
 use log::info;
 use scopeguard::guard;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -20,7 +18,7 @@ use super::manifest::{BackupKind, ChunkRef, FileInfo, Manifest};
 use crate::context::Context;
 
 const ZSTD_LEVEL: i32 = 3;
-const PROGRESS_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Args)]
 pub struct Options {
@@ -115,7 +113,7 @@ fn do_incremental(
             metrics.add_read(chunk.len() as u64);
 
             for small_block in chunk.chunks(8 * 1024) {
-                let hash: blake3::Hash = blake3::hash(small_block);
+                let hash = blake3::hash(small_block);
 
                 if block_changed(stripped_path, small_block_index, hash) {
                     let mut header = tar::Header::new_old();
@@ -132,12 +130,13 @@ fn do_incremental(
 
                 small_block_index += 1;
             }
+
+            metrics.log_progress(false);
         }
 
         if !changed_blocks.is_empty() {
             changed_files.insert(stripped_path.to_owned(), changed_blocks);
         }
-        metrics.log_progress(false);
     }
 
     bundle.into_inner().unwrap().finish()?;
@@ -152,7 +151,6 @@ fn do_incremental(
 
 fn do_full(ctx: &Context, metrics: &mut Metrics) -> Result<BackupKind> {
     let mut files = HashMap::new();
-
     for path in target_files(ctx) {
         let path = path?;
 
@@ -163,7 +161,7 @@ fn do_full(ctx: &Context, metrics: &mut Metrics) -> Result<BackupKind> {
         let mut chunker = Chunker::new(file);
         while let Some(chunk) = chunker.next_chunk() {
             metrics.add_read(chunk.len() as u64);
-            let hash: blake3::Hash = blake3::hash(chunk);
+            let hash = blake3::hash(chunk);
             chunks.push(ChunkRef(hash));
 
             let checksum = hex::encode(hash.as_bytes());
@@ -180,14 +178,15 @@ fn do_full(ctx: &Context, metrics: &mut Metrics) -> Result<BackupKind> {
             }
 
             for small_block in chunk.chunks(8 * 1024) {
-                let hash: blake3::Hash = blake3::hash(small_block);
+                let hash = blake3::hash(small_block);
                 blocks.push(ChunkRef(hash));
             }
+
+            metrics.log_progress(false);
         }
 
         let path = path.strip_prefix(&ctx.cluster_data)?;
         files.insert(path.to_owned(), FileInfo { chunks, blocks });
-        metrics.log_progress(false);
     }
 
     metrics.log_progress(true);
@@ -200,7 +199,6 @@ fn block_changed(
     delta_from: Uuid,
 ) -> impl FnMut(&Path, usize, blake3::Hash) -> bool + '_ {
     let mut manifests = HashMap::new();
-
     ctx.storage
         .join("backups")
         .read_dir()
@@ -241,13 +239,28 @@ fn block_changed(
     }
 }
 
-fn target_files(ctx: &Context) -> impl Iterator<Item = Result<PathBuf>> {
+// TODO: don't include unnecessary files + error handling
+fn target_files(ctx: &Context) -> impl Iterator<Item = Result<PathBuf>> + '_ {
+    let pred = |path: &Path| {
+        let path = path.strip_prefix(&ctx.cluster_data).unwrap();
+        !matches!(
+            path.components()
+                .nth(0)
+                .map(|c| c.as_os_str().to_str().unwrap()),
+            Some("pg_wal" | "current_logfiles" | "postmaster.pid")
+        )
+    };
+
     WalkDir::new(&ctx.cluster_data)
         .into_iter()
-        .filter(|entry| {
+        .filter(move |entry| {
             entry
                 .as_ref()
-                .map(|entry| entry.metadata().map(|metadata| metadata.is_file()))
+                .map(|entry| {
+                    entry
+                        .metadata()
+                        .map(|metadata| metadata.is_file() && pred(entry.path()))
+                })
                 .unwrap_or(Ok(true))
                 .unwrap_or(true)
         })
@@ -285,7 +298,7 @@ impl Metrics {
         self.written_bytes.set(self.written_bytes.get() + bytes);
     }
 
-    fn track_writer(&self, writer: impl Write) -> TrackedWriter<impl Write> {
+    fn track_writer<W>(&self, writer: W) -> TrackedWriter<W> {
         TrackedWriter {
             inner: writer,
             total_bytes: &self.written_bytes,
@@ -307,8 +320,9 @@ impl Metrics {
             let dedup_ratio = deduplicated_bytes as f32 / read_bytes as f32;
             let throughput = read_bytes as f32 / elapsed_secs / 1024.0 / 1024.0;
             info!(
-                "read: {} MiB, dedup: {} MiB ({:.2}%), write: {} MiB, compression ratio: {:.2}x, \
-                 throughput: {:.2} MiB/s",
+                "{}read: {} MiB, dedup: {} MiB ({:.2}%), write: {} MiB, compression ratio: \
+                 {:.2}x, throughput: {:.2} MiB/s",
+                if !last { "progress: " } else { "" },
                 read_bytes / 1024 / 1024,
                 deduplicated_bytes / 1024 / 1024,
                 dedup_ratio * 100.0,
