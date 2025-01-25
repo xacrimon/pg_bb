@@ -4,25 +4,28 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 
-[profile.ci]
-inherits = "dev"
-incremental = false
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.release]
 debug = "line-tables-only"
 strip = "debuginfo"
 lto = "thin"
+codegen-units = 1
 
 [dependencies]
-clap = { version = "4.5.20", features = ["derive"] }
+clap = { version = "4.5.27", features = ["derive"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_yaml = "0.9.34"
-anyhow = "1.0.91"
+anyhow = "1.0.95"
 zstd = "0.13.2"
-blake3 = { version = "1.5.4", features = ["serde"]}
-log = "0.4.22"
-env_logger = "0.11.5"
-tar = "0.4.42"
+blake3 = "1.5.5"
+log = "0.4.25"
+env_logger = "0.11.6"
+tar = "0.4.43"
 hex = "0.4.3"
 uuid = { version = "1.12.1", features = ["serde", "v4"] }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
+walkdir = "2.5.0"
+postgres = "0.19.9"
+scopeguard = "1.2.0"

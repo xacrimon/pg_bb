@@ -1,241 +1,342 @@
 use std::{
     cell::Cell,
-    cmp,
+    collections::HashMap,
     fs::{self, File},
-    io,
-    io::{Read, Write},
-    process::{Command, Stdio},
-    str,
-    sync::mpsc::{self, channel, TryRecvError},
-    thread,
-    time,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
-use ::time::OffsetDateTime;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::Args;
-use log::{error, info};
+use log::info;
+use scopeguard::guard;
 use uuid::Uuid;
+use walkdir::WalkDir;
 
-use super::manifest::Manifest;
+use super::manifest::{BackupKind, ChunkRef, FileInfo, Manifest};
 use crate::context::Context;
 
-const LABEL_SCAN_CHUNK_SIZE: u64 = 4096;
-const MIB_UNIT_SCALE: usize = 1024 * 1024;
 const ZSTD_LEVEL: i32 = 3;
-const PROGRESS_LOG_INTERVAL: time::Duration = time::Duration::from_secs(5);
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Args)]
 pub struct Options {
     #[arg(long)]
     pub label: String,
+
+    #[arg(long)]
+    pub delta: Option<String>,
 }
 
 pub fn run(ctx: &Context, opts: &Options) -> Result<()> {
-    let backup_time = OffsetDateTime::now_utc();
-    info!("starting backup with label {}", opts.label);
+    let id = Uuid::new_v4();
+    let created_at = time::OffsetDateTime::now_utc();
+    let mut client =
+        postgres::Client::connect("host=localhost user=postgres", postgres::NoTls).unwrap();
 
-    let mut child = Command::new("pg_basebackup")
-        .arg("-U")
-        .arg("postgres")
-        .arg("-D")
-        .arg("-")
-        .arg("-Ft")
-        .arg("-c")
-        .arg("fast")
-        .arg("-Xn")
-        .arg("-l")
-        .arg(&opts.label)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+    client
+        .execute("SELECT pg_backup_start($1, fast := true);", &[&opts.label])
+        .unwrap();
 
-    let (mut backup_stream, rx) = Splitter::new(child.stdout.take().unwrap());
-    let (label_tx, label_rx) = channel();
-    thread::spawn(move || {
-        let label_search = find_wal_label(rx);
-        label_tx.send(label_search).unwrap();
+    let client = guard(client, |mut client| {
+        client.execute("SELECT pg_backup_stop();", &[]).unwrap();
     });
-
-    let mut backup_buffered = Vec::new();
-    let label = loop {
-        match label_rx.try_recv() {
-            Ok(res) => break res?,
-            Err(TryRecvError::Empty) => (),
-            Err(TryRecvError::Disconnected) => unreachable!(),
-        }
-
-        let mut chunk = backup_stream.by_ref().take(LABEL_SCAN_CHUNK_SIZE);
-        let copied = io::copy(&mut chunk, &mut backup_buffered)?;
-
-        if copied == 0 {
-            unreachable!();
-        }
-    };
-
-    hex::decode(&label).expect("invalid label");
-    info!(
-        "found wal label {} after scanning {} bytes",
-        label,
-        backup_buffered.len()
-    );
 
     let backup_dir_path = ctx.storage.join("backups");
     if !backup_dir_path.exists() {
         fs::create_dir(&backup_dir_path)?;
     }
 
-    let bundle_id = Uuid::new_v4();
-    let backup_target_path = backup_dir_path.join(format!("{}.tar.zst", bundle_id));
-    let target_file = File::create(&backup_target_path)?;
-    info!("writing bundle to {:?}...", backup_target_path);
+    let bundle_dir_path = ctx.storage.join("bundles");
+    if !bundle_dir_path.exists() {
+        fs::create_dir(&bundle_dir_path)?;
+    }
 
-    let buffer_and_stream = backup_buffered.as_slice().chain(backup_stream.into_inner());
-    let total_read_bytes = Cell::new(0);
-    let total_written_bytes = Cell::new(0);
+    let chunk_dir_path = ctx.storage.join("chunks");
+    if !chunk_dir_path.exists() {
+        fs::create_dir(&chunk_dir_path)?;
+    }
 
-    let mut tracked_reader = TrackedHashingReader::new(buffer_and_stream, &total_read_bytes);
-    let tracked_writer = TrackedWriter::new(&target_file, &total_written_bytes);
-
-    type EncoderType<'a, 'b, 'c> = zstd::stream::Encoder<'a, TrackedWriter<'b, &'c File>>;
-    let chunk_size = EncoderType::recommended_input_size();
-    let mut encoder = EncoderType::new(tracked_writer, ZSTD_LEVEL)?;
-    let start_time = time::Instant::now();
-    let mut last_info = start_time;
-
-    let log_stats = |last: bool| {
-        let elapsed = start_time.elapsed().as_secs_f32();
-        let read = total_read_bytes.get() / MIB_UNIT_SCALE;
-        let written = total_written_bytes.get() / MIB_UNIT_SCALE;
-
-        info!(
-            "{header}processed {read} MiB @ {read_rate:.0} MiB/s, written {written} MiB @ \
-             {written_rate:.0} MiB/s, compression ratio: {ratio:.2}x",
-            header = if !last { "progress: " } else { "" },
-            read_rate = read as f32 / elapsed,
-            written_rate = written as f32 / elapsed,
-            ratio = total_read_bytes.get() as f32 / total_written_bytes.get() as f32
-        );
+    let mut metrics = Metrics::new();
+    let data = match &opts.delta {
+        Some(delta_from) => {
+            let delta_from_path = backup_dir_path.join(format!("{}.manifest", delta_from));
+            let delta_from_data = fs::read_to_string(&delta_from_path)?;
+            let delta_from: Manifest = serde_yaml::from_str(&delta_from_data)?;
+            do_incremental(ctx, &mut metrics, id, &delta_from)?
+        },
+        None => do_full(ctx, &mut metrics)?,
     };
 
-    loop {
-        let mut chunk = tracked_reader.by_ref().take(chunk_size as u64);
-        let copied = io::copy(&mut chunk, &mut encoder)?;
-
-        if copied == 0 {
-            break;
-        }
-
-        if last_info.elapsed() >= PROGRESS_LOG_INTERVAL {
-            log_stats(false);
-            last_info = time::Instant::now();
-        }
-    }
-
-    log_stats(true);
-    let status = child.wait()?;
-    if !status.success() {
-        error!("something went wrong, cleaning up...");
-        bail!("pg_basebackup failed with status: {}", status);
-    }
-
-    let manifest_target_path = backup_dir_path.join(format!("{}.yaml", bundle_id));
     let manifest = Manifest {
-        id: bundle_id,
-        created_at: backup_time,
+        id,
+        created_at,
         label: opts.label.clone(),
-        checksum: tracked_reader.finalize(),
+        data,
     };
 
-    info!("writing manifest to {:?}", manifest_target_path);
-    let serialized = serde_yaml::to_string(&manifest)?;
-    fs::write(&manifest_target_path, serialized)?;
+    let manifest_data = serde_yaml::to_string(&manifest).unwrap();
+    let manifest_path = backup_dir_path.join(format!("{}.manifest", opts.label));
+    let mut manifest_file = File::create_new(manifest_path)?;
+    manifest_file.write_all(manifest_data.as_bytes())?;
+    manifest_file.sync_all()?;
 
-    info!("write finished, flushing...");
-    encoder.finish()?;
-    info!("syncing file...");
-    target_file.sync_all()?;
-    info!("completed backup");
+    drop(client);
     Ok(())
 }
 
-fn find_wal_label(stream: SplitReceiver) -> Result<String> {
-    let mut archive = tar::Archive::new(stream);
-    let mut buffer = Vec::new();
+fn do_incremental(
+    ctx: &Context,
+    metrics: &mut Metrics,
+    id: Uuid,
+    delta_from: &Manifest,
+) -> Result<BackupKind> {
+    let mut block_changed = block_changed(ctx, delta_from.id);
+    let mut changed_files = HashMap::new();
+    let bundle_path = ctx.storage.join("bundles").join(format!("{}.tar.zst", id));
+    let bundle_file = File::create_new(&bundle_path)?;
+    let tracked_writer = metrics.track_writer(&bundle_file);
+    let mut bundle =
+        tar::Builder::new(zstd::stream::Encoder::new(tracked_writer, ZSTD_LEVEL).unwrap());
 
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        if entry.path()?.to_str() != Some("backup_label") {
-            continue;
+    for path in target_files(ctx) {
+        let path = path?;
+        let stripped_path = path.as_path().strip_prefix(&ctx.cluster_data)?;
+
+        let mut changed_blocks = HashMap::new();
+        let mut small_block_index = 0;
+
+        let file = File::open(&path)?;
+        let mut chunker = Chunker::new(file);
+        while let Some(chunk) = chunker.next_chunk() {
+            metrics.add_read(chunk.len() as u64);
+
+            for small_block in chunk.chunks(8 * 1024) {
+                let hash = blake3::hash(small_block);
+
+                if block_changed(stripped_path, small_block_index, hash) {
+                    let mut header = tar::Header::new_old();
+                    let block_path = stripped_path.join(small_block_index.to_string());
+
+                    header.set_path(&block_path)?;
+                    header.set_size(small_block.len() as u64);
+
+                    bundle.append(&header, small_block)?;
+                    changed_blocks.insert(small_block_index, ChunkRef(hash));
+                } else {
+                    metrics.add_deduplicated(small_block.len() as u64);
+                }
+
+                small_block_index += 1;
+            }
+
+            metrics.log_progress(false);
         }
 
-        buffer.clear();
-        let len = entry.read_to_end(&mut buffer)?;
-        let contents = str::from_utf8(&buffer[..len])?;
-
-        for line in contents.lines() {
-            if !line.starts_with("START WAL LOCATION") {
-                continue;
-            }
-
-            let part = match line.split("file").nth(1) {
-                Some(part) => part,
-                None => continue,
-            };
-
-            if part.len() < 2 {
-                continue;
-            }
-
-            return Ok(part[1..part.len() - 1].to_string());
+        if !changed_blocks.is_empty() {
+            changed_files.insert(stripped_path.to_owned(), changed_blocks);
         }
     }
 
-    bail!("No backup label found")
+    bundle.into_inner().unwrap().finish()?;
+    bundle_file.sync_all()?;
+
+    metrics.log_progress(true);
+    Ok(BackupKind::Incremental {
+        references: delta_from.id,
+        changed_blocks: changed_files,
+    })
 }
 
-struct TrackedHashingReader<'tracker, R> {
-    inner: R,
-    total_bytes: &'tracker Cell<usize>,
-    hash_state: blake3::Hasher,
+fn do_full(ctx: &Context, metrics: &mut Metrics) -> Result<BackupKind> {
+    let mut files = HashMap::new();
+    for path in target_files(ctx) {
+        let path = path?;
+
+        let mut chunks = Vec::new();
+        let mut blocks = Vec::new();
+
+        let file = File::open(&path)?;
+        let mut chunker = Chunker::new(file);
+        while let Some(chunk) = chunker.next_chunk() {
+            metrics.add_read(chunk.len() as u64);
+            let hash = blake3::hash(chunk);
+            chunks.push(ChunkRef(hash));
+
+            let checksum = hex::encode(hash.as_bytes());
+            let chunk_path = ctx.storage.join("chunks").join(&checksum);
+
+            if !chunk_path.exists() {
+                let chunk_data = zstd::bulk::compress(chunk, ZSTD_LEVEL).unwrap();
+                let mut chunk_file = File::create_new(&chunk_path)?;
+                chunk_file.write_all(&chunk_data)?;
+                chunk_file.sync_all()?;
+                metrics.add_written(chunk_data.len() as u64);
+            } else {
+                metrics.add_deduplicated(chunk.len() as u64);
+            }
+
+            for small_block in chunk.chunks(8 * 1024) {
+                let hash = blake3::hash(small_block);
+                blocks.push(ChunkRef(hash));
+            }
+
+            metrics.log_progress(false);
+        }
+
+        let path = path.strip_prefix(&ctx.cluster_data)?;
+        files.insert(path.to_owned(), FileInfo { chunks, blocks });
+    }
+
+    metrics.log_progress(true);
+    Ok(BackupKind::Full { files })
 }
 
-impl<'tracker, R> TrackedHashingReader<'tracker, R> {
-    fn new(inner: R, total_bytes: &'tracker Cell<usize>) -> Self {
+// TODO: error handling + avoid loading all manifests?
+fn block_changed(
+    ctx: &Context,
+    delta_from: Uuid,
+) -> impl FnMut(&Path, usize, blake3::Hash) -> bool + '_ {
+    let mut manifests = HashMap::new();
+    ctx.storage
+        .join("backups")
+        .read_dir()
+        .unwrap()
+        .for_each(|entry| {
+            let entry = entry.unwrap();
+            let manifest_path = entry.path();
+            let manifest_data = fs::read_to_string(&manifest_path).unwrap();
+            let manifest: Manifest = serde_yaml::from_str(&manifest_data).unwrap();
+            manifests.insert(manifest.id, manifest);
+        });
+
+    move |file, index, hash| {
+        let mut node = delta_from;
+
+        loop {
+            match &manifests[&node].data {
+                BackupKind::Full { files } => {
+                    let info = files.get(file);
+                    break info.map(|info| info.blocks.get(index)).flatten()
+                        != Some(&ChunkRef(hash));
+                },
+                BackupKind::Incremental {
+                    references,
+                    changed_blocks,
+                } => {
+                    let blocks = changed_blocks.get(file);
+                    let chunk_ref = blocks.map(|blocks| blocks.get(&index)).flatten();
+
+                    if let Some(chunk_ref) = chunk_ref {
+                        break chunk_ref != &ChunkRef(hash);
+                    } else {
+                        node = *references;
+                    }
+                },
+            }
+        }
+    }
+}
+
+// TODO: don't include unnecessary files + error handling
+fn target_files(ctx: &Context) -> impl Iterator<Item = Result<PathBuf>> + '_ {
+    let pred = |path: &Path| {
+        let path = path.strip_prefix(&ctx.cluster_data).unwrap();
+        !matches!(
+            path.components()
+                .nth(0)
+                .map(|c| c.as_os_str().to_str().unwrap()),
+            Some("pg_wal" | "current_logfiles" | "postmaster.pid")
+        )
+    };
+
+    WalkDir::new(&ctx.cluster_data)
+        .into_iter()
+        .filter(move |entry| {
+            entry
+                .as_ref()
+                .map(|entry| {
+                    entry
+                        .metadata()
+                        .map(|metadata| metadata.is_file() && pred(entry.path()))
+                })
+                .unwrap_or(Ok(true))
+                .unwrap_or(true)
+        })
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path().to_owned())
+                .map_err(Into::into)
+        })
+}
+
+struct Metrics {
+    start_time: Instant,
+    last_log_time: Cell<Instant>,
+    read_bytes: Cell<u64>,
+    deduplicated_bytes: Cell<u64>,
+    written_bytes: Cell<u64>,
+}
+
+impl Metrics {
+    fn new() -> Self {
         Self {
-            inner,
-            total_bytes,
-            hash_state: blake3::Hasher::new(),
+            start_time: Instant::now(),
+            last_log_time: Cell::new(Instant::now()),
+            read_bytes: Cell::new(0),
+            deduplicated_bytes: Cell::new(0),
+            written_bytes: Cell::new(0),
         }
     }
 
-    fn finalize(self) -> blake3::Hash {
-        self.hash_state.finalize()
+    fn add_read(&self, bytes: u64) {
+        self.read_bytes.set(self.read_bytes.get() + bytes);
     }
-}
 
-impl<'tracker, R> Read for TrackedHashingReader<'tracker, R>
-where
-    R: Read,
-{
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let len = self.inner.read(buf)?;
-        self.total_bytes.set(self.total_bytes.get() + len);
-        self.hash_state.update(&buf[..len]);
-        Ok(len)
+    fn add_written(&self, bytes: u64) {
+        self.written_bytes.set(self.written_bytes.get() + bytes);
+    }
+
+    fn track_writer<W>(&self, writer: W) -> TrackedWriter<W> {
+        TrackedWriter {
+            inner: writer,
+            total_bytes: &self.written_bytes,
+        }
+    }
+
+    fn add_deduplicated(&self, bytes: u64) {
+        self.deduplicated_bytes
+            .set(self.deduplicated_bytes.get() + bytes);
+    }
+
+    fn log_progress(&self, last: bool) {
+        if last || self.last_log_time.get().elapsed() >= PROGRESS_LOG_INTERVAL {
+            self.last_log_time.set(Instant::now());
+            let read_bytes = self.read_bytes.get();
+            let deduplicated_bytes = self.deduplicated_bytes.get();
+            let written_bytes = self.written_bytes.get();
+            let elapsed_secs = self.start_time.elapsed().as_secs_f32();
+            let dedup_ratio = deduplicated_bytes as f32 / read_bytes as f32;
+            let throughput = read_bytes as f32 / elapsed_secs / 1024.0 / 1024.0;
+            info!(
+                "{}read: {} MiB, dedup: {} MiB ({:.2}%), write: {} MiB, compression ratio: \
+                 {:.2}x, throughput: {:.2} MiB/s",
+                if !last { "progress: " } else { "" },
+                read_bytes / 1024 / 1024,
+                deduplicated_bytes / 1024 / 1024,
+                dedup_ratio * 100.0,
+                written_bytes / 1024 / 1024,
+                (read_bytes - deduplicated_bytes) as f32 / written_bytes as f32,
+                throughput
+            );
+        }
     }
 }
 
 struct TrackedWriter<'tracker, W> {
     inner: W,
-    total_bytes: &'tracker Cell<usize>,
-}
-
-impl<'tracker, W> TrackedWriter<'tracker, W> {
-    fn new(inner: W, total_bytes: &'tracker Cell<usize>) -> Self {
-        Self { inner, total_bytes }
-    }
+    total_bytes: &'tracker Cell<u64>,
 }
 
 impl<'tracker, W> Write for TrackedWriter<'tracker, W>
@@ -244,7 +345,7 @@ where
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let len = self.inner.write(buf)?;
-        self.total_bytes.set(self.total_bytes.get() + len);
+        self.total_bytes.set(self.total_bytes.get() + len as u64);
         Ok(len)
     }
 
@@ -253,59 +354,46 @@ where
     }
 }
 
-struct Splitter<R> {
-    inner: R,
-    tx: mpsc::Sender<Vec<u8>>,
+struct Chunker<R> {
+    reader: R,
+    buffer: Vec<u8>,
+    buffer_pos: usize,
 }
 
-impl<R> Splitter<R> {
-    fn new(inner: R) -> (Self, SplitReceiver) {
-        let (tx, rx) = channel();
-        (Self { inner, tx }, SplitReceiver::new(rx))
-    }
-
-    fn into_inner(self) -> R {
-        self.inner
-    }
-}
-
-impl<R> Read for Splitter<R>
+impl<R> Chunker<R>
 where
     R: Read,
 {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let len = self.inner.read(buf)?;
-        let _ = self.tx.send(buf[..len].to_vec());
-        Ok(len)
-    }
-}
-
-struct SplitReceiver {
-    rx: mpsc::Receiver<Vec<u8>>,
-    buf: Vec<u8>,
-}
-
-impl SplitReceiver {
-    fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
+    fn new(reader: R) -> Self {
         Self {
-            rx,
-            buf: Vec::new(),
+            reader,
+            buffer: vec![0; 4 * 1024 * 1024],
+            buffer_pos: 0,
         }
     }
-}
 
-impl Read for SplitReceiver {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.buf.is_empty() {
-            match self.rx.recv() {
-                Ok(data) => self.buf = data,
-                Err(_) => return Ok(0),
+    fn next_chunk(&mut self) -> Option<&[u8]> {
+        loop {
+            let read = self
+                .reader
+                .read(&mut self.buffer[self.buffer_pos..])
+                .unwrap();
+            if read == 0 {
+                if self.buffer_pos == 0 {
+                    return None;
+                } else {
+                    let buf = &self.buffer[..self.buffer_pos];
+                    self.buffer_pos = 0;
+                    return Some(buf);
+                }
+            }
+
+            self.buffer_pos += read;
+            if self.buffer_pos == self.buffer.len() {
+                let buf = &self.buffer[..self.buffer_pos];
+                self.buffer_pos = 0;
+                return Some(buf);
             }
         }
-
-        let len = cmp::min(buf.len(), self.buf.len());
-        buf[..len].copy_from_slice(&self.buf[..len]);
-        self.buf.drain(..len);
-        Ok(len)
     }
 }
